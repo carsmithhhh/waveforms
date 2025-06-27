@@ -1,6 +1,6 @@
 '''
-Based on 'waveform.py' from sirentv repo, but making following changes:
-    - Scintillation Modlel: Instead of computing pdf from cdf, we want to sample from 
+Based on 'waveform.py' from sirentv repo (originally from larnd sim), but making following changes:
+    - Scintillation Modlel: Instead of computing pdf from cdf, we sample from 
       exponential distribution of arrival times for each tick
 '''
 
@@ -55,15 +55,23 @@ class BatchedLightSimulation(nn.Module):
 
         def create_parameter(value, nominal):
             return nn.Parameter(torch.tensor(value / nominal, dtype=torch.float32))
+        
+        # Exact nominal values
+        self.singlet_fraction = cfg.NOMINAL_SINGLET_FRACTION
+        self.tau_s = cfg.NOMINAL_TAU_S
+        self.tau_t = cfg.NOMINAL_TAU_T
+        self.light_oscillation_period = cfg.NOMINAL_LIGHT_OSCILLATION_PERIOD
+        self.light_response_time = cfg.NOMINAL_LIGHT_RESPONSE_TIME
+        self.light_gain_value = cfg.NOMINAL_LIGHT_GAIN
 
         # Calculate and store nominal values
         self.nominal_values = {
-            'singlet_fraction_logit': logit(cfg.NOMINAL_SINGLET_FRACTION),
-            'log_tau_s': np.log10(cfg.NOMINAL_TAU_S),
-            'log_tau_t': np.log10(cfg.NOMINAL_TAU_T),
-            'log_light_oscillation_period': np.log10(cfg.NOMINAL_LIGHT_OSCILLATION_PERIOD),
-            'log_light_response_time': np.log10(cfg.NOMINAL_LIGHT_RESPONSE_TIME),
-            'light_gain': cfg.NOMINAL_LIGHT_GAIN
+            'singlet_fraction_logit': logit(self.singlet_fraction),
+            'log_tau_s': np.log10(self.tau_s),
+            'log_tau_t': np.log10(self.tau_t),
+            'log_light_oscillation_period': np.log10(self.light_oscillation_period),
+            'log_light_response_time': np.log10(self.light_response_time),
+            'light_gain': self.light_gain_value
         }
 
         # Calculate current values
@@ -93,7 +101,6 @@ class BatchedLightSimulation(nn.Module):
 
         self.k = 100
 
-
         if verbose:
             self.register_grad_hook()
 
@@ -105,6 +112,53 @@ class BatchedLightSimulation(nn.Module):
         super().to(device)
         return self
     
+    def safe_logit(self, p, eps=1e-9):
+        p = np.clip(p, eps, 1 - eps)
+        return np.log(p / (1 - p))
+    
+    def reconfigure(self, params: dict):
+        self.singlet_fraction = params['singlet_fraction']
+        self.tau_s = params['tau_s']
+        self.tau_t = params['tau_t']
+        self.light_oscillation_period = params['light_oscillation_period']
+        self.light_response_time = params['light_response_time']
+        self.light_gain_value = params['light_gain']
+
+        # Update trainable parameters (normalized by nominal values)
+        with torch.no_grad():
+            self.singlet_fraction_logit.data = torch.tensor(
+                self.safe_logit(self.singlet_fraction) / self.nominal_singlet_fraction_logit,
+                dtype=torch.float32,
+                device=self.singlet_fraction_logit.device
+            )
+            self.log_tau_s.data = torch.tensor(
+                np.log10(self.tau_s) / self.nominal_log_tau_s,
+                dtype=torch.float32,
+                device=self.log_tau_s.device
+            )
+            self.log_tau_t.data = torch.tensor(
+                np.log10(self.tau_t) / self.nominal_log_tau_t,
+                dtype=torch.float32,
+                device=self.log_tau_t.device
+            )
+            self.log_light_oscillation_period.data = torch.tensor(
+                np.log10(self.light_oscillation_period) / self.nominal_log_light_oscillation_period,
+                dtype=torch.float32,
+                device=self.log_light_oscillation_period.device
+            )
+            self.log_light_response_time.data = torch.tensor(
+                np.log10(self.light_response_time) / self.nominal_log_light_response_time,
+                dtype=torch.float32,
+                device=self.log_light_response_time.device
+            )
+            self.light_gain.data = torch.tensor(
+                self.light_gain_value / self.nominal_light_gain,
+                dtype=torch.float32,
+                device=self.light_gain.device
+            )
+        return
+
+    
     @property
     def device(self):
         return next(self.parameters()).device
@@ -113,6 +167,188 @@ class BatchedLightSimulation(nn.Module):
         for name, p in self.named_parameters():
             p.register_hook(print_grad(name))
 
+    def scintillation_model_sampled(self, timing_dist: torch.Tensor) -> torch.Tensor:
+        '''
+        Parameters:
+            - timing_dist: Tensor of shape (ndet, nticks) representing photon counts per time tick for each detector.
+                           We assume only time ticks 2560 to 2570 are non-zero.
+        Returns:
+            - Tensor of shape (ndet, nticks) storing updated photon hit counts after applying scintillation delays.
+        '''
+        # Debugging things
+        info = dict()
+        info['num_singlets'] = 0
+        info['num_triplets'] = 0
+        ##################
+        
+        device = timing_dist.device
+        if timing_dist.ndim < 3:
+            timing_dist = timing_dist.unsqueeze(0)
+        nbatch, ndet, nticks = timing_dist.shape
+    
+        # Define time ticks
+        time_ticks = torch.arange(nticks, device=device)
+        bin_width = self.light_tick_size  # Size of each time bin in microseconds
+
+        all_emission_delays = [] # in units of microseconds
+        delayed_counts = torch.zeros_like(timing_dist) # in units of time ticks
+        
+        nonzero_indices = torch.nonzero(timing_dist)
+
+        for (batch, det, tick) in nonzero_indices:
+            n_photons = int(timing_dist[batch, det, tick].item())
+            if n_photons == 0:
+                continue
+
+            # Sample singlet vs triplet for each photon
+            singlet_fraction = self.singlet_fraction
+            is_singlet = torch.rand((n_photons,), device=device) < singlet_fraction
+
+            # Sample emission delays
+            tau_s = self.tau_s
+            tau_t = self.tau_t
+
+            num_singlets = is_singlet.sum().item()
+            singlet_delays = torch.distributions.Exponential(1.0 / tau_s).sample((num_singlets,)).to(device)
+
+            num_triplets = (~is_singlet).sum().item()
+            triplet_delays = torch.distributions.Exponential(1.0 / tau_t).sample((num_triplets,)).to(device)
+
+            info['num_singlets'] += num_singlets
+            info['num_triplets'] += num_triplets
+
+            emission_delays = torch.cat([singlet_delays, triplet_delays])
+            all_emission_delays.append(emission_delays)
+
+            # Map delays to time bins
+            base_time = tick * self.light_tick_size  # microseconds
+            photon_times = base_time + emission_delays  # absolute photon times in microseconds
+
+            bin_centers = time_ticks * self.light_tick_size
+            bin_edges = torch.cat([
+                bin_centers[:1] - bin_width / 2,  # left edge of first bin
+                bin_centers + bin_width / 2      # right edges
+            ])
+
+            bin_indices = torch.bucketize(photon_times, bin_edges) - 1  # Adjust for 0-based indexing
+
+            # Count photons in each bin
+            valid_mask = (bin_indices >= 0) & (bin_indices < nticks)
+            bin_indices = bin_indices[valid_mask]
+            counts = torch.bincount(bin_indices, minlength=nticks)
+
+            delayed_counts[batch, det] += counts
+    
+        return all_emission_delays, delayed_counts, info
+
+    def tpb_delay(self, timing_dist: torch.Tensor, tau=0.002):
+        '''
+        Parameters:
+            - timing_dist: Tensor of shape (nbatch, ndet, nticks) representing photon counts per time tick for each detector.
+            - tau: lifetime of tpb re-emission spectrum
+        Returns:
+            - Tensor of shape (ndet, nticks) storing updated photon hit counts after applying scintillation delays.
+        '''
+        device = timing_dist.device
+        if timing_dist.ndim < 3:
+            timing_dist = timing_dist.unsqueeze(0)
+        nbatch, ndet, nticks = timing_dist.shape
+    
+        # Define time ticks
+        time_ticks = torch.arange(nticks, device=device)
+        bin_width = self.light_tick_size  # Size of each time bin in microseconds
+
+        all_emission_delays = []
+
+        delayed_counts = torch.zeros_like(timing_dist) # in units of time ticks
+        
+        for batch in range(nbatch):
+            # get nonzero (pmt_id, tick) indices in timing_dist
+            nonzero_indices = torch.nonzero(timing_dist[batch, :, :])
+            
+            for (pmt_id, tick) in nonzero_indices:
+                n_photons = int(timing_dist[batch, pmt_id, tick].item())
+                emission_delays = torch.distributions.Exponential(1.0 / tau).sample((n_photons,)).to(device)
+                all_emission_delays.append(emission_delays)
+    
+                # Map delays to time bins
+                base_time = tick * self.light_tick_size  # microseconds
+                photon_times = base_time + emission_delays  # absolute photon times in microseconds
+    
+                bin_centers = time_ticks * self.light_tick_size
+                bin_edges = torch.cat([
+                    bin_centers[:1] - bin_width / 2,  # left edge of first bin
+                    bin_centers + bin_width / 2      # right edges
+                ])
+    
+                bin_indices = torch.bucketize(photon_times, bin_edges) - 1  # Adjust for 0-based indexing
+    
+                # Count photons in each bin
+                valid_mask = (bin_indices >= 0) & (bin_indices < nticks)
+                bin_indices = bin_indices[valid_mask]
+                counts = torch.bincount(bin_indices, minlength=nticks)
+    
+                delayed_counts[batch, pmt_id] += counts
+            
+        return all_emission_delays, delayed_counts
+
+    def gen_waveform(self, mode='precise', **kwargs):
+        if mode == 'precise':
+            return self._gen_waveform_precise(**kwargs)
+        elif mode == 'gaussian':
+            return self._gen_waveform_gaussian(**kwargs)
+        else:
+            pass
+            
+    def _gen_waveform_precise(self, pmt_ids: torch.Tensor, arrival_times: torch.Tensor, nphotons:int=1, n_pmts:int=128):
+        '''
+        Parameters:
+            - pmt_ids: tensor of shape (n_photons,), integers in [0, n_pmts)
+            - arrival_times: tensor of shape (n_photons,), integer tick values
+            - n_pmts: number of PMTs (default 128)
+        Returns:
+            - waveform: tensor of shape (n_pmts, n_ticks), where each row is a histogram of arrivals over time
+                        photon arrival times are offset by 2560 ticks
+        '''
+        assert pmt_ids.shape == arrival_times.shape
+
+        n_ticks = 16000
+
+        arrival_times = arrival_times + 2560 # adding an offset
+
+        waveform = torch.zeros((n_pmts, n_ticks))
+        waveform.index_put_((pmt_ids, arrival_times), torch.full_like(pmt_ids, nphotons, dtype=waveform.dtype), accumulate=True)
+
+        return waveform
+
+    def _gen_waveform_gaussian(self, pmt_ids: torch.Tensor, nphotons: torch.Tensor, arrival_mean:float=0.0, std:float=1.0, n_pmts:int=128):
+        '''
+        Parameters:
+            - pmt_ids: tensor of shape (<=n_pmts,), integers in [0, n_pmts)
+            - nphotons: tensor of shape (<=n_pmts,); number of photons per pmt
+            - arrival_mean: mean for arrival time gaussian
+            - std: gaussian std for arrival time sampling (default 1 microsecond)
+            - n_pmts: number of PMTs (default 128)
+        '''
+        assert pmt_ids.shape == nphotons.shape
+
+        n_ticks = 16000 # 16000 nanoseconds / 16 microseconds
+
+        # for each pmt in pmt_ids
+        # for each photon in nphotons[pmt_id]
+        # sample arrival time from gaussian w std centered around 0
+        waveform = torch.zeros((n_pmts, n_ticks))
+        
+        for i, pmt_id in enumerate(pmt_ids):
+            pmt_arrival_times = torch.normal(mean=arrival_mean + 2560, std=std * 1000, size=(nphotons[i],)) # offsetting arrival mean
+            arrival_bins = torch.clamp(pmt_arrival_times.round().long(), min=0, max=n_ticks - 1)
+            waveform.index_put_((torch.full_like(arrival_bins, pmt_id), arrival_bins),
+                torch.ones_like(arrival_bins, dtype=waveform.dtype),
+                accumulate=True)
+
+        return waveform
+            
+        
     def scintillation_model(self, time_tick: torch.Tensor, relax_cut: bool=True) -> torch.Tensor:
         """
         Calculates the fraction of scintillation photons emitted
@@ -147,7 +383,6 @@ class BatchedLightSimulation(nn.Module):
 
         return (p1 + p3) * (t >= 0).float()
     
-
     def sipm_response_model(self, time_tick, relax_cut=True) -> torch.Tensor:
         """
         Calculates the SiPM response from a PE at `time_tick` relative to the PE time
@@ -176,7 +411,6 @@ class BatchedLightSimulation(nn.Module):
         impulse *= light_oscillation_period**2 + light_response_time**2
         return impulse * self.light_tick_size
 
-    
     def fft_conv(self, light_sample_inc: torch.Tensor, model: Callable) -> torch.Tensor:
         """
         Performs a Fast Fourier Transform (FFT) convolution on the input light sample.
@@ -285,27 +519,40 @@ class BatchedLightSimulation(nn.Module):
         downsample = waveform.view(ninput, ndet, ntick_down, ns_per_tick).sum(dim=3)
         return downsample
 
-    def forward(self, timing_dist: torch.Tensor, relax_cut: bool=True):
+    def forward(self, timing_dist: torch.Tensor, scintillation=True, tpb_delay=False):
+        '''
+        Parameters:
+            - timing_dist: Tensor of shape (nbatch, ndet, nticks)
+        Returns:
+            - Tensor of shape (nbatch, ndet, nticks) after processing.
+        '''
         reshaped = False
-        if timing_dist.ndim == 1:  # ndet=1, ninput=1; (ntick) -> (1, 1, ntick)
+        if timing_dist.ndim == 1:
             timing_dist = timing_dist[None, None, :]
             reshaped = True
-        elif timing_dist.ndim == 2:  # ndet>1, ninput=1; (ndet, ntick) -> (1, ndet, ntick)
+        elif timing_dist.ndim == 2:
             timing_dist = timing_dist[None, :, :]
             reshaped = True
+    
+        nbatch, ndet, nticks = timing_dist.shape
 
-        x = self.fft_conv(
-            timing_dist, partial(self.scintillation_model, relax_cut=relax_cut)
-        )
-        x = self.fft_conv(x, partial(self.sipm_response_model, relax_cut=relax_cut))
+        emission_delays = []
+
+        if scintillation:
+            emission_delays, x, info = self.scintillation_model_sampled(timing_dist) # stochastic photon emission sampling
+            info['scintillation_delays'] = emission_delays
+        if tpb_delay:
+            tpb_emission_delays, x = self.tpb_delay(x) # stochastic re-emission from tpb
+            info['tpb_emission_delays'] = tpb_emission_delays
+        x = self.fft_conv(x, partial(self.sipm_response_model)) # convolving with SiPM response kernel
         x = self.light_gain * self.nominal_light_gain * x
         x = self.downsample_waveform(x)
-
+    
         if reshaped:
-            return x.squeeze(0).squeeze(0)
-
-        return x
-
+            return x.squeeze(0).squeeze(0), info, emission_delays
+        
+        return x, info, emission_delays
+        
 class TimingDistributionSampler:
     def __init__(self, cdf: np.ndarray, output_shape: tuple):
         super().__init__()
