@@ -348,41 +348,6 @@ class BatchedLightSimulation(nn.Module):
                 accumulate=True)
 
         return waveform
-            
-        
-    def scintillation_model(self, time_tick: torch.Tensor, relax_cut: bool=True) -> torch.Tensor:
-        """
-        Calculates the fraction of scintillation photons emitted
-        during time interval `time_tick` to `time_tick + 1`
-
-        Args:
-            time_tick (torch.Tensor): time tick relative to t0
-            relax_cut (bool): whether to apply the relaxing cut for differentiability
-
-        Returns:
-            torch.Tensor: fraction of scintillation photons
-        """
-
-        singlet_fraction = torch.sigmoid(self.singlet_fraction_logit * self.nominal_singlet_fraction_logit)
-        tau_s = torch.pow(10, self.log_tau_s * self.nominal_log_tau_s)
-        tau_t = torch.pow(10, self.log_tau_t * self.nominal_log_tau_t)
-        t = time_tick * self.light_tick_size
-
-        p1 = (
-            singlet_fraction
-            * torch.exp(-t / tau_s)
-            * (1 - torch.exp(-self.light_tick_size / tau_s))
-        )
-        p3 = (
-            (1 - singlet_fraction)
-            * torch.exp(-t / tau_t)
-            * (1 - torch.exp(-self.light_tick_size / tau_t))
-        )
-        
-        if relax_cut:
-            return (p1 + p3) / (1 + torch.exp(-self.k * t))
-
-        return (p1 + p3) * (t >= 0).float()
     
     def sipm_response_model(self, time_tick, relax_cut=True) -> torch.Tensor:
         """
