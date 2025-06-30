@@ -306,6 +306,7 @@ class BatchedLightSimulation(nn.Module):
         Parameters:
             - pmt_ids: tensor of shape (n_photons,), integers in [0, n_pmts)
             - arrival_times: tensor of shape (n_photons,), integer tick values
+            - nphotons (scalar): photons per arrival time
             - n_pmts: number of PMTs (default 128)
         Returns:
             - waveform: tensor of shape (n_pmts, n_ticks), where each row is a histogram of arrivals over time
