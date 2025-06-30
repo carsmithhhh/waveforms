@@ -2,6 +2,7 @@
 Based on 'waveform.py' from sirentv repo (originally from larnd sim), but making following changes:
     - Scintillation Modlel: Instead of computing pdf from cdf, we sample from 
       exponential distribution of arrival times for each tick
+    - TPB Wavelength Shifter Model: Stochastic sampling from re-emission timing distribution with lifetime 2 nanoseconds
 '''
 
 import math
