@@ -122,6 +122,7 @@ class BatchedLightSimulation(nn.Module):
         self.singlet_fraction = params['singlet_fraction']
         self.tau_s = params['tau_s']
         self.tau_t = params['tau_t']
+        self.tpb_tau = params['tpb_tau']
         self.light_oscillation_period = params['light_oscillation_period']
         self.light_response_time = params['light_response_time']
         self.light_gain_value = params['light_gain']
@@ -244,10 +245,11 @@ class BatchedLightSimulation(nn.Module):
 
         end_time = time.time()
         print(f"total scintillation delay time: {end_time - start_time:.4f} sec")
+        info['scintillation_delays'] = torch.cat(all_emission_delays)
     
-        return all_emission_delays, delayed_counts, info
+        return delayed_counts, info
 
-    def tpb_delay(self, timing_dist: torch.Tensor, tau=0.002):
+    def tpb_delay(self, timing_dist: torch.Tensor):
         '''
         Parameters:
             - timing_dist: Tensor of shape (nbatch, ndet, nticks) representing photon counts per time tick for each detector.
@@ -277,7 +279,7 @@ class BatchedLightSimulation(nn.Module):
             if n_photons == 0:
                 continue
             
-            emission_delays = torch.distributions.Exponential(1.0 / tau).sample((n_photons,)).to(device)
+            emission_delays = torch.distributions.Exponential(1.0 / self.tpb_tau).sample((n_photons,)).to(device)
             all_emission_delays.append(emission_delays)
 
             base_time = tick * self.light_tick_size  # microseconds
@@ -303,79 +305,88 @@ class BatchedLightSimulation(nn.Module):
         print(f"Photon delay and binning time: {end_photon - start_photon:.4f} sec")
 
         return all_emission_delays, delayed_counts
-    
-    def all_stochastic_sampling(self, timing_dist: torch.Tensor, tpb_tau=0.002) -> torch.Tensor:
+
+    def all_stochastic_sampling_vec(self, timing_dist:torch.Tensor) -> torch.Tensor:
         '''
-        Combining stochastic scintillation + tpb re-emission delay sampling to get speedup
-        Will give 2 orders of magnitude speedup if input timing_dist has many photons per (pmt_id, arrival_time) coordinate
+        Combines stochastic scintillation + TPB re-emission delay sampling with full batching.
+        Offers major speedups for high photon occupancy per (batch, det, tick).
         '''
         start_total = time.time()
-
-        info = dict()
-        info['num_singlets'] = 0
-        info['num_triplets'] = 0
 
         device = timing_dist.device
         if timing_dist.ndim < 3:
             timing_dist = timing_dist.unsqueeze(0)
         nbatch, ndet, nticks = timing_dist.shape
+    
+        bin_width = self.light_tick_size
+    
+        # finding nonzero photon time bins
+        nz = torch.nonzero(timing_dist, as_tuple=False)  # shape (N, 3)
+        n_photons_per_bin = timing_dist[nz[:, 0], nz[:, 1], nz[:, 2]].long()
 
-        # Define time ticks
-        time_ticks = torch.arange(nticks, device=device)
-        bin_width = self.light_tick_size  # Size of each time bin in microseconds
+        total_photons = n_photons_per_bin.sum().item()
+        if total_photons == 0:
+            delayed_counts = torch.zeros_like(timing_dist)
+            return [], [], delayed_counts, {'num_singlets': 0, 'num_triplets': 0}
 
-        all_scintillation_delays = []
-        all_tpb_delays = []
-        delayed_counts = torch.zeros_like(timing_dist) # in units of time ticks
+        # expanding photon coordinates for each photon
+        photon_offsets = torch.repeat_interleave(nz, n_photons_per_bin, dim=0)
+        batch_ids = photon_offsets[:, 0]
+        det_ids = photon_offsets[:, 1]
+        base_ticks = photon_offsets[:, 2]
 
-        nonzero_indices = torch.nonzero(timing_dist)
-
-        for (batch, det, tick) in nonzero_indices:
-            n_photons = int(timing_dist[batch, det, tick].item())
-            if n_photons == 0:
-                continue
-
-            # Scintillation Delay Sampling
-            is_singlet = torch.rand((n_photons,), device=device) < self.singlet_fraction
+        # vectorized sampling of scintillation and TPB delays
+        with torch.no_grad():
+            is_singlet = torch.rand((total_photons,), device=device) < self.singlet_fraction
             num_singlets = is_singlet.sum().item()
-            singlet_delays = torch.distributions.Exponential(1.0 / self.tau_s).sample((num_singlets,)).to(device)
-            num_triplets = (~is_singlet).sum().item()
-            triplet_delays = torch.distributions.Exponential(1.0 / self.tau_t).sample((num_triplets,)).to(device)
-            scintillation_delays = torch.cat([singlet_delays, triplet_delays])
-            all_scintillation_delays.append(scintillation_delays)
+            num_triplets = total_photons - num_singlets
+    
+            scintillation_delays = torch.empty((total_photons,), device=device)
+            scintillation_delays[is_singlet] = torch.empty((num_singlets,), device=device).exponential_(1.0 / self.tau_s)
+            scintillation_delays[~is_singlet] = torch.empty((num_triplets,), device=device).exponential_(1.0 / self.tau_t)
+    
+            tpb_delays = torch.empty((total_photons,), device=device).exponential_(1.0 / self.tpb_tau)
 
-            info['num_singlets'] += num_singlets
-            info['num_triplets'] += num_triplets
-            
-            # TPB Delay Sampling
-            tpb_delays = torch.distributions.Exponential(1.0 / tpb_tau).sample((n_photons,)).to(device)
-            all_tpb_delays.append(tpb_delays)
-
-            # Map delays to time bins
-            base_time = tick * self.light_tick_size  # microseconds
-            photon_times = base_time + scintillation_delays + tpb_delays  # absolute photon times in microseconds
-
-            bin_centers = time_ticks * self.light_tick_size
+            # computing total photon arrival time
+            base_times = base_ticks * bin_width
+            photon_times = base_times + scintillation_delays + tpb_delays
+            photon_times = photon_times.double() 
+            bin_indices = torch.floor(photon_times / bin_width).long()
+            valid_mask = (bin_indices >= 0) & (bin_indices < nticks)
+    
+           # defining bin edges from bin centers
+            time_ticks = torch.arange(nticks, device=device)
+            bin_centers = time_ticks * bin_width
             bin_edges = torch.cat([
-                bin_centers[:1] - bin_width / 2,  # left edge of first bin
-                bin_centers + bin_width / 2      # right edges
+                bin_centers[:1] - bin_width / 2,
+                bin_centers + bin_width / 2
             ])
-
-            bin_indices = torch.bucketize(photon_times, bin_edges) - 1  # Adjust for 0-based indexing
-
-            # Count photons in each bin
+            
+            # bucketize to assign photons to bins
+            photon_times = photon_times.double()  # increase precision to avoid edge artifacts
+            bin_indices = torch.bucketize(photon_times, bin_edges) - 1  # adjust to 0-based indexing
+            
+            # removing photons outside the valid time bin range
             valid_mask = (bin_indices >= 0) & (bin_indices < nticks)
             bin_indices = bin_indices[valid_mask]
-            counts = torch.bincount(bin_indices, minlength=nticks)
-
-            delayed_counts[batch, det] += counts
-
+            batch_ids = batch_ids[valid_mask]
+            det_ids = det_ids[valid_mask]
+                
+            # making histogram w/ (batch, det, time) using index_add_
+            delayed_counts = torch.zeros((nbatch, ndet, nticks), device=device)
+            flat_idx = batch_ids * ndet * nticks + det_ids * nticks + bin_indices
+            delayed_counts.view(-1).index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=delayed_counts.dtype))
+    
         end_total = time.time()
         print(f"total combined sampling time: {end_total - start_total:.4f} sec")
 
-        return all_scintillation_delays, all_tpb_delays, delayed_counts, info
+        return (
+            delayed_counts,
+            {'num_singlets': num_singlets, 'num_triplets': num_triplets, 
+             'scintillation_delays': scintillation_delays.tolist(), 'tpb_emission_delays': tpb_delays.tolist()}
+        )
 
-
+                    
     def gen_waveform(self, mode='precise', **kwargs):
         if mode == 'precise':
             return self._gen_waveform_precise(**kwargs)
@@ -590,22 +601,19 @@ class BatchedLightSimulation(nn.Module):
         emission_delays = []
 
         if combined:
-            all_scintillation_delays, all_tpb_delays, x, info = self.all_stochastic_sampling(timing_dist)
-            info['scintillation_delays'] = all_scintillation_delays
-            info['tpb_emission_delays'] = all_tpb_delays
+            x, info = self.all_stochastic_sampling_vec(timing_dist)
         if scintillation and not combined:
-            emission_delays, x, info = self.scintillation_model_sampled(timing_dist) # stochastic photon emission sampling
-            info['scintillation_delays'] = emission_delays
+            x, info = self.scintillation_model_sampled(timing_dist) # stochastic photon emission sampling
         if tpb_delay and not combined:
             tpb_emission_delays, x = self.tpb_delay(x) # stochastic re-emission from tpb
-            info['tpb_emission_delays'] = tpb_emission_delays
+            info['tpb_emission_delays'] = torch.cat(tpb_emission_delays)
 
         x = self.fft_conv(x, partial(self.sipm_response_model)) # convolving with SiPM response kernel
         x = self.light_gain * self.nominal_light_gain * x
         x = self.downsample_waveform(x)
         
         end_time = time.time()
-        print(f"foward time: {end_time - start_time:.4f} sec")
+        print(f"forward time: {end_time - start_time:.4f} sec")
     
         if reshaped:
             return x.squeeze(0).squeeze(0), info
