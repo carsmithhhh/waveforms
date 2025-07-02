@@ -94,6 +94,7 @@ class BatchedLightSimulation(nn.Module):
         # Constants
         self.light_tick_size = cfg.LIGHT_TICK_SIZE
         self.light_window = cfg.LIGHT_WINDOW
+        self.downsample_factor = 16 # time ticks per new bin
 
         self.conv_ticks = math.ceil(
             (self.light_window[1] - self.light_window[0]) / self.light_tick_size
@@ -126,6 +127,8 @@ class BatchedLightSimulation(nn.Module):
         self.light_oscillation_period = params['light_oscillation_period']
         self.light_response_time = params['light_response_time']
         self.light_gain_value = params['light_gain']
+        self.light_tick_size = params['light_tick_size']
+        self.downsample_factor = params['downsample_factor']
 
         # Update trainable parameters (normalized by nominal values)
         with torch.no_grad():
@@ -311,7 +314,6 @@ class BatchedLightSimulation(nn.Module):
         Combines stochastic scintillation + TPB re-emission delay sampling with full batching.
         Offers major speedups for high photon occupancy per (batch, det, tick).
         '''
-        start_total = time.time()
 
         device = timing_dist.device
         if timing_dist.ndim < 3:
@@ -376,9 +378,6 @@ class BatchedLightSimulation(nn.Module):
             delayed_counts = torch.zeros((nbatch, ndet, nticks), device=device)
             flat_idx = batch_ids * ndet * nticks + det_ids * nticks + bin_indices
             delayed_counts.view(-1).index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=delayed_counts.dtype))
-    
-        end_total = time.time()
-        print(f"total combined sampling time: {end_total - start_total:.4f} sec")
 
         return (
             delayed_counts,
@@ -455,7 +454,7 @@ class BatchedLightSimulation(nn.Module):
         Returns:
             torch.Tensor: response
         """
-
+        start_time = time.time()
         t = time_tick * self.light_tick_size
         light_oscillation_period = torch.pow(10, self.log_light_oscillation_period * self.nominal_log_light_oscillation_period)
         light_response_time = torch.pow(10, self.log_light_response_time * self.nominal_log_light_response_time)
@@ -470,6 +469,9 @@ class BatchedLightSimulation(nn.Module):
 
         impulse /= light_oscillation_period * light_response_time**2
         impulse *= light_oscillation_period**2 + light_response_time**2
+
+        end_time = time.time()
+        print(f"sipm response conv. time: {end_time - start_time:.4f} sec")
         return impulse * self.light_tick_size
 
     def fft_conv(self, light_sample_inc: torch.Tensor, model: Callable) -> torch.Tensor:
@@ -563,21 +565,21 @@ class BatchedLightSimulation(nn.Module):
 
         return output
 
-    def downsample_waveform(self, waveform: torch.Tensor, ns_per_tick: int = 16) -> torch.Tensor:
+    def downsample_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Downsample the input waveform by summing over groups of ticks.
         This effectively compresses the waveform in the time dimension while preserving the total signal.
 
         Args:
             waveform (torch.Tensor): Input waveform tensor of shape (ninput, ndet, ntick), where each tick corresponds to 1 ns.
-            ns_per_tick (int, optional): Number of nanoseconds per tick in the downsampled waveform. Defaults to 16.
+            self.downsample_factor is ns_per_tick (int, optional): Number of nanoseconds per tick in the downsampled waveform. Defaults to 16.
 
         Returns:
             torch.Tensor: Downsampled waveform of shape (ninput, ndet, ntick_down).
         """
         ninput, ndet, ntick = waveform.shape
-        ntick_down = ntick // ns_per_tick
-        downsample = waveform.view(ninput, ndet, ntick_down, ns_per_tick).sum(dim=3)
+        ntick_down = ntick // self.downsample_factor
+        downsample = waveform.view(ninput, ndet, ntick_down, self.downsample_factor).sum(dim=3)
         return downsample
 
     def forward(self, timing_dist: torch.Tensor, scintillation=True, tpb_delay=True, combined=True):
@@ -601,7 +603,18 @@ class BatchedLightSimulation(nn.Module):
         emission_delays = []
 
         if combined:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_start = time.time()
             x, info = self.all_stochastic_sampling_vec(timing_dist)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_end = time.time()
+            print(f"total combined sampling time: {total_end - total_start:.4f} sec")
+        
+            with open("sampling_times.txt", "a") as f:
+                f.write(f"{total_end - total_start:.4f}\n")
+            
         if scintillation and not combined:
             x, info = self.scintillation_model_sampled(timing_dist) # stochastic photon emission sampling
         if tpb_delay and not combined:
@@ -610,7 +623,7 @@ class BatchedLightSimulation(nn.Module):
 
         x = self.fft_conv(x, partial(self.sipm_response_model)) # convolving with SiPM response kernel
         x = self.light_gain * self.nominal_light_gain * x
-        x = self.downsample_waveform(x)
+        # x = self.downsample_waveform(x)
         
         end_time = time.time()
         print(f"forward time: {end_time - start_time:.4f} sec")
