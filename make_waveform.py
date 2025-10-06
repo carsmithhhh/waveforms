@@ -46,7 +46,7 @@ class BatchedLightSimulation(nn.Module):
     - res: simulation resolution (factor of final resolution) i.e. 10 means simulate 10 ticks per nanosecond (100 picosecond resolution before binning)
     - offset: offset waveform timing from 0, in nanoseconds
     '''
-    def __init__(self, cfg: str = os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), wf_length=8000, res=10, offset=10, verbose: bool=False):
+    def __init__(self, cfg: str = os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), wf_length=8000, downsample_factor=10, offset=10, verbose: bool=False):
         super().__init__()
 
         if isinstance(cfg, str):
@@ -57,9 +57,8 @@ class BatchedLightSimulation(nn.Module):
 
         self.cfg = cfg
 
-        self.n_ticks = wf_length * res
-        self.offset = offset * res
-        self.res = res
+        self.n_ticks = wf_length * downsample_factor
+        self.offset = offset * downsample_factor
 
         # Load in and transform parameters
         def logit(x):
@@ -104,7 +103,7 @@ class BatchedLightSimulation(nn.Module):
         # Constants
         self.light_tick_size = cfg.LIGHT_TICK_SIZE
         self.light_window = cfg.LIGHT_WINDOW
-        self.downsample_factor = 10 # time ticks per new bin - simulate at 100 picosecond resolution (10 sub-ticks per nanosecond)
+        self.downsample_factor = downsample_factor # time ticks per new bin - simulate at 100 picosecond resolution (10 sub-ticks per nanosecond)
 
         self.conv_ticks = math.ceil(
             (self.light_window[1] - self.light_window[0]) / self.light_tick_size
@@ -186,7 +185,9 @@ class BatchedLightSimulation(nn.Module):
         if 'downsample_factor' in params:
             self.downsample_factor = params['downsample_factor']
         if 'offset' in params:
-            self.offset = params['offset'] * self.res
+            self.offset = params['offset'] * self.downsample_factor
+        if 'n_ticks' in params:
+            self.n_ticks = params['n_ticks']
 
     @property
     def device(self):
@@ -609,7 +610,7 @@ class BatchedLightSimulation(nn.Module):
         downsample = waveform.view(ninput, ndet, ntick_down, self.downsample_factor).sum(dim=3)
         return downsample
     
-    def forward(self, timing_dist: torch.Tensor, scintillation=True, tpb_delay=True, combined=True, jax=False):
+    def forward(self, timing_dist: torch.Tensor, scintillation=False, tpb_delay=False, combined=True):
         '''
         Parameters:
             - timing_dist: Tensor of shape (nbatch, ndet, nticks)
@@ -631,15 +632,6 @@ class BatchedLightSimulation(nn.Module):
 
         x = timing_dist
         info = None
-
-        if jax and combined:
-            x, info = self.all_stochastic_sampling_vec(x)
-            x = self.fft_conv_jax(x, partial(self.sipm_response_model_jax))
-            x = self.light_gain * self.nominal_light_gain * x
-            if reshaped:
-                return x.squeeze(0).squeeze(0), info
-
-            return x, info
 
         if combined:
             if torch.cuda.is_available():
