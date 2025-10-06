@@ -12,5 +12,5 @@ NOMINAL_TAU_S: 0.001                       # us
 NOMINAL_TAU_T: 1.530                       # us
 NOMINAL_LIGHT_GAIN: -45.0                  # ADC us/pe
 
-LIGHT_TICK_SIZE: 0.001
+LIGHT_TICK_SIZE: 0.001 # 100 picoseconds, in units of microseconds
 LIGHT_WINDOW: [1, 10]
