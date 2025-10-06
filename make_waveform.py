@@ -59,6 +59,7 @@ class BatchedLightSimulation(nn.Module):
 
         self.n_ticks = wf_length * res
         self.offset = offset * res
+        self.res = res
 
         # Load in and transform parameters
         def logit(x):
@@ -185,7 +186,7 @@ class BatchedLightSimulation(nn.Module):
         if 'downsample_factor' in params:
             self.downsample_factor = params['downsample_factor']
         if 'offset' in params:
-            self.offset = params['offset']
+            self.offset = params['offset'] * self.res
 
     @property
     def device(self):
