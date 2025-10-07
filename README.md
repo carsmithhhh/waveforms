@@ -3,7 +3,7 @@ Waveform simulator for LArTPC PMTs
 
 Based off of waveform simulator from `larnd-sim`, but includes stochastic processes for scintillation delay and TPB wavelength shifter re-emission. Also includes functionality to generate pre-simulation waveforms as inputs.
 
-**Waveform simulator steps:**
+**Waveform Simulator Summary:**
 * Input is N photons and timing
 * Each photon gets a delay sampled from a prompt or delayed scintillation light distribution (dictated by `singlet_fraction` parameter)
 * Each photon gets a delay sampled from tpb re-emission timing distribution with lifetime of 2 nanoseconds
