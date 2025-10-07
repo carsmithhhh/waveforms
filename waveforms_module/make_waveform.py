@@ -43,7 +43,8 @@ class BatchedLightSimulation(nn.Module):
     '''
     Params:
     - wf_length: waveform length in nanoseconds
-    - res: simulation resolution (factor of final resolution) i.e. 10 means simulate 10 ticks per nanosecond (100 picosecond resolution before binning)
+    - res: simulation resolution (factor of final resolution) i.e. 10 means simulate 10 ticks per nanosecond (100 picosecond
+    resolution before binning)
     - offset: offset waveform timing from 0, in nanoseconds
     '''
     def __init__(self, cfg: str = os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), wf_length=8000, downsample_factor=10, offset=10, verbose: bool=False):
@@ -339,7 +340,6 @@ class BatchedLightSimulation(nn.Module):
         Combines stochastic scintillation + TPB re-emission delay sampling with full batching.
         Offers major speedups for high photon occupancy per (batch, det, tick).
         '''
-
         device = timing_dist.device
         if timing_dist.ndim < 3:
             timing_dist = timing_dist.unsqueeze(0)
@@ -428,7 +428,8 @@ class BatchedLightSimulation(nn.Module):
             - n_pmts: number of PMTs (default 128)
         Returns:
             - waveform: tensor of shape (n_pmts, n_ticks), where each row is a histogram of arrivals over time
-            - from larnd sim, photon arrival times are offset by 2560 ticks. Default value here is 10 ticks (10 * 100 picoseconds = 1 nanosecond)
+            - from larnd sim, photon arrival times are offset by 2560 ticks. Default value here is 10 ticks (10 * 100 picoseconds
+            = 1 nanosecond)
         '''
         assert pmt_ids.shape == arrival_times.shape
         arrival_times = arrival_times + self.offset # adding an offset
@@ -600,7 +601,8 @@ class BatchedLightSimulation(nn.Module):
         Args:
             waveform (torch.Tensor): Input waveform tensor of shape (n
             input, ndet, ntick), where each tick corresponds to 1 ns.
-            self.downsample_factor is ns_per_tick (int, optional): Number of nanoseconds per tick in the downsampled waveform. Defaults to 16.
+            self.downsample_factor is ns_per_tick (int, optional): Number of nanoseconds per tick in the downsampled waveform.
+            Defaults to 16.
 
         Returns:
             torch.Tensor: Downsampled waveform of shape (ninput, ndet, ntick_down).
@@ -687,7 +689,6 @@ class TimingDistributionSampler:
     def batch_sample(self, nphoton: int, nbatch: int) -> torch.Tensor:
         return torch.stack([self(nphoton) for _ in range(nbatch)])
 
-
-data_path = os.path.join(os.path.dirname(__file__), "data/lightLUT_Mod0_06052024_32.1.16_time_dist_cdf.npz")
+data_path = os.path.join(os.path.dirname(__file__), "/sdf/home/c/carsmith/flash_reconstruction/waveforms/data/lightLUT_Mod0_06052024_32.1.16_time_dist_cdf.npz")
 data = np.load(data_path)
 mod0_sampler = TimingDistributionSampler(**data)
